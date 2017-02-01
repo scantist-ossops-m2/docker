@@ -41,7 +41,6 @@ func (daemon *Daemon) StateChanged(id string, e libcontainerd.StateInfo) error {
 		daemon.updateHealthMonitor(c)
 		daemon.LogContainerEvent(c, "oom")
 	case libcontainerd.StateExit:
-
 		c.Lock()
 		c.StreamConfig.Wait()
 		c.Reset(false)

@@ -10,7 +10,7 @@ import (
 	"github.com/docker/swarmkit/protobuf/ptypes"
 )
 
-func networkAttachementFromGRPC(na *swarmapi.NetworkAttachment) types.NetworkAttachment {
+func networkAttachmentFromGRPC(na *swarmapi.NetworkAttachment) types.NetworkAttachment {
 	if na != nil {
 		return types.NetworkAttachment{
 			Network:   networkFromGRPC(na.Network),

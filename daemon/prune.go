@@ -24,7 +24,7 @@ func (daemon *Daemon) ContainersPrune(pruneFilters filters.Args) (*types.Contain
 	allContainers := daemon.List()
 	for _, c := range allContainers {
 		if !c.IsRunning() {
-			cSize, _ := daemon.getSize(c)
+			cSize, _ := daemon.getSize(c.ID)
 			// TODO: sets RmLink to true?
 			err := daemon.ContainerRm(c.ID, &types.ContainerRmConfig{})
 			if err != nil {

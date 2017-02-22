@@ -76,6 +76,7 @@ type Daemon struct {
 	ID                        string
 	repository                string
 	containers                container.Store
+	containersReplica         *container.MemDB
 	execCommands              *exec.Store
 	referenceStore            reference.Store
 	downloadManager           *xfer.LayerDownloadManager
@@ -175,11 +176,15 @@ func (daemon *Daemon) restore() error {
 	activeSandboxes := make(map[string]interface{})
 	for id, c := range containers {
 		if err := daemon.registerName(c); err != nil {
+			logrus.Errorf("Failed to register container name %s: %s", c.ID, err)
+			delete(containers, id)
+			continue
+		}
+		if err := daemon.Register(c); err != nil {
 			logrus.Errorf("Failed to register container %s: %s", c.ID, err)
 			delete(containers, id)
 			continue
 		}
-		daemon.Register(c)
 
 		// verify that all volumes valid and have been migrated from the pre-1.7 layout
 		if err := daemon.verifyVolumesInfo(c); err != nil {
@@ -690,6 +695,9 @@ func NewDaemon(config *Config, registryService registry.Service, containerdRemot
 	d.ID = trustKey.PublicKey().KeyID()
 	d.repository = daemonRepo
 	d.containers = container.NewMemoryStore()
+	if d.containersReplica, err = container.NewMemDB(); err != nil {
+		return nil, err
+	}
 	d.execCommands = exec.NewStore()
 	d.referenceStore = referenceStore
 	d.distributionMetadataStore = distributionMetadataStore

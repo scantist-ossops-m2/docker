@@ -32,6 +32,18 @@ var (
 	getPortMapInfo    = container.GetSandboxPortMapInfo
 )
 
+func (daemon *Daemon) saveAndReplicate(container *container.Container) error {
+	container.Lock()
+	defer container.Unlock()
+	if err := daemon.containersReplica.Save(container.Snapshot()); err != nil {
+		return fmt.Errorf("Error replicating container state: %v", err)
+	}
+	if err := container.ToDisk(); err != nil {
+		return fmt.Errorf("Error saving container to disk: %v", err)
+	}
+	return nil
+}
+
 func (daemon *Daemon) buildSandboxOptions(container *container.Container) ([]libnetwork.SandboxOption, error) {
 	var (
 		sboxOptions []libnetwork.SandboxOption
@@ -981,7 +993,7 @@ func (daemon *Daemon) ConnectToNetwork(container *container.Container, idOrName 
 			return err
 		}
 	}
-	if err := container.ToDisk(); err != nil {
+	if err := daemon.saveAndReplicate(container); err != nil {
 		return fmt.Errorf("Error saving container to disk: %v", err)
 	}
 	return nil
@@ -1020,16 +1032,16 @@ func (daemon *Daemon) DisconnectFromNetwork(container *container.Container, netw
 		return err
 	}
 
-	if err := container.ToDisk(); err != nil {
+	if err := daemon.saveAndReplicate(container); err != nil {
 		return fmt.Errorf("Error saving container to disk: %v", err)
 	}
 
 	if n != nil {
-		attributes := map[string]string{
+		daemon.LogNetworkEventWithAttributes(n, "disconnect", map[string]string{
 			"container": container.ID,
-		}
-		daemon.LogNetworkEventWithAttributes(n, "disconnect", attributes)
+		})
 	}
+
 	return nil
 }
 

@@ -52,8 +52,7 @@ func (daemon *Daemon) update(name string, hostConfig *container.HostConfig) erro
 		if restoreConfig {
 			container.Lock()
 			container.HostConfig = &backupHostConfig
-			daemon.containersReplica.Save(container.Snapshot())
-			container.ToDisk()
+			container.CheckpointAndSaveToDisk(daemon.containersReplica)
 			container.Unlock()
 		}
 	}()
@@ -68,7 +67,7 @@ func (daemon *Daemon) update(name string, hostConfig *container.HostConfig) erro
 		container.Unlock()
 		return errCannotUpdate(container.ID, err)
 	}
-	if err := daemon.containersReplica.Save(container.Snapshot()); err != nil {
+	if err := container.CheckpointTo(daemon.containersReplica); err != nil {
 		restoreConfig = true
 		container.Unlock()
 		return errCannotUpdate(container.ID, err)

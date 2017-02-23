@@ -31,7 +31,7 @@ func TestNoneHealthcheck(t *testing.T) {
 			State: &container.State{},
 		},
 	}
-	store, err := container.NewMemDB()
+	store, err := container.NewViewDB()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestHealthStates(t *testing.T) {
 		},
 	}
 
-	store, err := container.NewMemDB()
+	store, err := container.NewViewDB()
 	if err != nil {
 		t.Fatal(err)
 	}

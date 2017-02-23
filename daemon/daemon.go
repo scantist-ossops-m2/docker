@@ -39,7 +39,7 @@ import (
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/libcontainerd"
-	"github.com/docker/docker/migrate/v1"
+	v1 "github.com/docker/docker/migrate/v1"
 	"github.com/docker/docker/pkg/fileutils"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/plugingetter"
@@ -76,7 +76,7 @@ type Daemon struct {
 	ID                        string
 	repository                string
 	containers                container.Store
-	containersReplica         *container.MemDB
+	containersReplica         container.ViewDB
 	execCommands              *exec.Store
 	referenceStore            reference.Store
 	downloadManager           *xfer.LayerDownloadManager
@@ -695,7 +695,7 @@ func NewDaemon(config *Config, registryService registry.Service, containerdRemot
 	d.ID = trustKey.PublicKey().KeyID()
 	d.repository = daemonRepo
 	d.containers = container.NewMemoryStore()
-	if d.containersReplica, err = container.NewMemDB(); err != nil {
+	if d.containersReplica, err = container.NewViewDB(); err != nil {
 		return nil, err
 	}
 	d.execCommands = exec.NewStore()

@@ -243,6 +243,10 @@ func TestMigratePre17Volumes(t *testing.T) {
 		}
 	`)
 
+	viewDB, err := container.NewViewDB()
+	if err != nil {
+		t.Fatal(err)
+	}
 	volStore, err := store.New(volumeRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -253,7 +257,12 @@ func TestMigratePre17Volumes(t *testing.T) {
 	}
 	volumedrivers.Register(drv, volume.DefaultDriverName)
 
-	daemon := &Daemon{root: rootDir, repository: containerRoot, volumes: volStore}
+	daemon := &Daemon{
+		root:              rootDir,
+		repository:        containerRoot,
+		containersReplica: viewDB,
+		volumes:           volStore,
+	}
 	err = ioutil.WriteFile(filepath.Join(containerRoot, cid, "config.v2.json"), config, 600)
 	if err != nil {
 		t.Fatal(err)

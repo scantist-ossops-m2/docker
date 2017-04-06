@@ -545,7 +545,7 @@ func (daemon *Daemon) allocateNetwork(container *container.Container) error {
 		}
 	}
 
-	if err := container.WriteHostConfig(); err != nil {
+	if _, err := container.WriteHostConfig(); err != nil {
 		return err
 	}
 	networkActions.WithValues("allocate").UpdateSince(start)

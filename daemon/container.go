@@ -18,6 +18,7 @@ import (
 	"github.com/docker/docker/runconfig"
 	"github.com/docker/docker/runconfig/opts"
 	"github.com/docker/go-connections/nat"
+	"github.com/opencontainers/runc/libcontainer/label"
 )
 
 // GetContainer looks for a container using the provided information, which could be
@@ -78,6 +79,9 @@ func (daemon *Daemon) load(id string) (*container.Container, error) {
 	container := daemon.newBaseContainer(id)
 
 	if err := container.FromDisk(); err != nil {
+		return nil, err
+	}
+	if err := label.ReserveLabel(container.ProcessLabel); err != nil {
 		return nil, err
 	}
 
@@ -272,7 +276,7 @@ func (daemon *Daemon) verifyContainerSettings(hostConfig *containertypes.HostCon
 			return nil, fmt.Errorf("maximum retry count cannot be negative")
 		}
 	case "":
-	// do nothing
+		// do nothing
 	default:
 		return nil, fmt.Errorf("invalid restart policy '%s'", p.Name)
 	}

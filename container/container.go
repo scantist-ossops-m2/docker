@@ -43,7 +43,6 @@ import (
 	"github.com/docker/libnetwork/options"
 	"github.com/docker/libnetwork/types"
 	agentexec "github.com/docker/swarmkit/agent/exec"
-	"github.com/opencontainers/runc/libcontainer/label"
 )
 
 const configFileName = "config.v2.json"
@@ -132,9 +131,6 @@ func (container *Container) FromDisk() error {
 		return err
 	}
 
-	if err := label.ReserveLabel(container.ProcessLabel); err != nil {
-		return err
-	}
 	return container.readHostConfig()
 }
 

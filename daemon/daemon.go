@@ -1348,3 +1348,13 @@ func CreateDaemonRoot(config *Config) error {
 
 	return nil
 }
+
+// checkpointAndSave grabs a container lock to safely call container.CheckpointTo
+func (daemon *Daemon) checkpointAndSave(container *container.Container) error {
+	container.Lock()
+	defer container.Unlock()
+	if err := container.CheckpointTo(daemon.containersReplica); err != nil {
+		return fmt.Errorf("Error saving container state: %v", err)
+	}
+	return nil
+}

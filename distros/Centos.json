@@ -14,7 +14,6 @@
       "  glibc-static \\",
       "  glibc-devel \\",
       "  glibc-headers \\",
-      "  golang-googlecode-sqlite-devel \\",
       "  kernel-devel \\",
       "  libcap-devel \\",
       "  libvirt-client \\",

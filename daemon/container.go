@@ -15,8 +15,10 @@ import (
 	"github.com/docker/docker/pkg/signal"
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/pkg/truncindex"
+	"github.com/docker/docker/runconfig"
 	"github.com/docker/docker/runconfig/opts"
 	"github.com/docker/go-connections/nat"
+	"github.com/opencontainers/runc/libcontainer/label"
 )
 
 // GetContainer looks for a container using the provided information, which could be
@@ -79,6 +81,9 @@ func (daemon *Daemon) load(id string) (*container.Container, error) {
 	if err := container.FromDisk(); err != nil {
 		return nil, err
 	}
+	if err := label.ReserveLabel(container.ProcessLabel); err != nil {
+		return nil, err
+	}
 
 	if container.ID != id {
 		return container, fmt.Errorf("Container %s is stored at %s", container.ID, id)
@@ -96,10 +101,14 @@ func (daemon *Daemon) Register(c *container.Container) error {
 		c.StreamConfig.NewNopInputPipe()
 	}
 
+	// once in the memory store it is visible to other goroutines
+	// grab a Lock until it has been checkpointed to avoid races
+	c.Lock()
+	defer c.Unlock()
+
 	daemon.containers.Add(c.ID, c)
 	daemon.idIndex.Add(c.ID)
-
-	return nil
+	return c.CheckpointTo(daemon.containersReplica)
 }
 
 func (daemon *Daemon) newContainer(name string, config *containertypes.Config, hostConfig *containertypes.HostConfig, imgID image.ID, managed bool) (*container.Container, error) {
@@ -201,14 +210,9 @@ func (daemon *Daemon) setHostConfig(container *container.Container, hostConfig *
 		return err
 	}
 
-	// make sure links is not nil
-	// this ensures that on the next daemon restart we don't try to migrate from legacy sqlite links
-	if hostConfig.Links == nil {
-		hostConfig.Links = []string{}
-	}
-
+	runconfig.SetDefaultNetModeIfBlank(hostConfig)
 	container.HostConfig = hostConfig
-	return container.ToDisk()
+	return container.CheckpointTo(daemon.containersReplica)
 }
 
 // verifyContainerSettings performs validation of the hostconfig and config
@@ -272,7 +276,7 @@ func (daemon *Daemon) verifyContainerSettings(hostConfig *containertypes.HostCon
 			return nil, fmt.Errorf("maximum retry count cannot be negative")
 		}
 	case "":
-	// do nothing
+		// do nothing
 	default:
 		return nil, fmt.Errorf("invalid restart policy '%s'", p.Name)
 	}

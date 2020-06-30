@@ -39,7 +39,7 @@ import (
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/libcontainerd"
-	"github.com/docker/docker/migrate/v1"
+	v1 "github.com/docker/docker/migrate/v1"
 	"github.com/docker/docker/pkg/fileutils"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/plugingetter"
@@ -76,6 +76,7 @@ type Daemon struct {
 	ID                        string
 	repository                string
 	containers                container.Store
+	containersReplica         container.ViewDB
 	execCommands              *exec.Store
 	referenceStore            reference.Store
 	downloadManager           *xfer.LayerDownloadManager
@@ -175,20 +176,19 @@ func (daemon *Daemon) restore() error {
 	activeSandboxes := make(map[string]interface{})
 	for id, c := range containers {
 		if err := daemon.registerName(c); err != nil {
-			logrus.Errorf("Failed to register container %s: %s", c.ID, err)
+			logrus.Errorf("Failed to register container name %s: %s", c.ID, err)
 			delete(containers, id)
 			continue
+		}
+		// verify that all volumes valid and have been migrated from the pre-1.7 layout
+		if err := daemon.verifyVolumesInfo(c); err != nil {
+			// don't skip the container due to error
+			logrus.Errorf("Failed to verify volumes for container '%s': %v", c.ID, err)
 		}
 		if err := daemon.Register(c); err != nil {
 			logrus.Errorf("Failed to register container %s: %s", c.ID, err)
 			delete(containers, id)
 			continue
-		}
-
-		// verify that all volumes valid and have been migrated from the pre-1.7 layout
-		if err := daemon.verifyVolumesInfo(c); err != nil {
-			// don't skip the container due to error
-			logrus.Errorf("Failed to verify volumes for container '%s': %v", c.ID, err)
 		}
 
 		// The LogConfig.Type is empty if the container was created before docker 1.12 with default log driver.
@@ -202,17 +202,18 @@ func (daemon *Daemon) restore() error {
 		}
 	}
 
-	var migrateLegacyLinks bool // Not relevant on Windows
 	var wg sync.WaitGroup
 	var mapLock sync.Mutex
 	for _, c := range containers {
 		wg.Add(1)
 		go func(c *container.Container) {
 			defer wg.Done()
-			if err := backportMountSpec(c); err != nil {
-				logrus.Error("Failed to migrate old mounts to use new spec format")
+			daemon.backportMountSpec(c)
+			if err := daemon.checkpointAndSave(c); err != nil {
+				logrus.WithError(err).WithField("container", c.ID).Error("error saving backported mountspec to disk")
 			}
 
+			daemon.setStateCounter(c)
 			if c.IsRunning() || c.IsPaused() {
 				c.RestartManager().Cancel() // manually start containers because some need to wait for swarm networking
 				if err := daemon.containerd.Restore(c.ID, c.InitializeStdio); err != nil {
@@ -230,7 +231,6 @@ func (daemon *Daemon) restore() error {
 					// The error is only logged here.
 					logrus.Warnf("Failed to mount container on getting BaseFs path %v: %v", c.ID, err)
 				} else {
-					// if mount success, then unmount it
 					if err := daemon.Unmount(c); err != nil {
 						logrus.Warnf("Failed to umount container on getting BaseFs path %v: %v", c.ID, err)
 					}
@@ -268,6 +268,7 @@ func (daemon *Daemon) restore() error {
 				}
 			}
 
+			c.Lock()
 			if c.RemovalInProgress {
 				// We probably crashed in the middle of a removal, reset
 				// the flag.
@@ -278,28 +279,19 @@ func (daemon *Daemon) restore() error {
 				// be removed. So we put the container in the "dead"
 				// state and leave further processing up to them.
 				logrus.Debugf("Resetting RemovalInProgress flag from %v", c.ID)
-				c.ResetRemovalInProgress()
-				c.SetDead()
-				c.ToDisk()
+				c.RemovalInProgress = false
+				c.Dead = true
+				if err := c.CheckpointTo(daemon.containersReplica); err != nil {
+					logrus.Errorf("Failed to update container %s state: %v", c.ID, err)
+				}
 			}
-
-			// if c.hostConfig.Links is nil (not just empty), then it is using the old sqlite links and needs to be migrated
-			if c.HostConfig != nil && c.HostConfig.Links == nil {
-				migrateLegacyLinks = true
-			}
+			c.Unlock()
 		}(c)
 	}
 	wg.Wait()
 	daemon.netController, err = daemon.initNetworkController(daemon.configStore, activeSandboxes)
 	if err != nil {
 		return fmt.Errorf("Error initializing network controller: %v", err)
-	}
-
-	// Perform migration of legacy sqlite links (no-op on Windows)
-	if migrateLegacyLinks {
-		if err := daemon.sqliteMigration(containers); err != nil {
-			return err
-		}
 	}
 
 	// Now that all the containers are registered, register the links
@@ -704,6 +696,9 @@ func NewDaemon(config *Config, registryService registry.Service, containerdRemot
 	d.ID = trustKey.PublicKey().KeyID()
 	d.repository = daemonRepo
 	d.containers = container.NewMemoryStore()
+	if d.containersReplica, err = container.NewViewDB(); err != nil {
+		return nil, err
+	}
 	d.execCommands = exec.NewStore()
 	d.referenceStore = referenceStore
 	d.distributionMetadataStore = distributionMetadataStore
@@ -1351,5 +1346,15 @@ func CreateDaemonRoot(config *Config) error {
 		return err
 	}
 
+	return nil
+}
+
+// checkpointAndSave grabs a container lock to safely call container.CheckpointTo
+func (daemon *Daemon) checkpointAndSave(container *container.Container) error {
+	container.Lock()
+	defer container.Unlock()
+	if err := container.CheckpointTo(daemon.containersReplica); err != nil {
+		return fmt.Errorf("Error saving container state: %v", err)
+	}
 	return nil
 }

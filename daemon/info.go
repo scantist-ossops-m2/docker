@@ -4,13 +4,11 @@ import (
 	"fmt"
 	"os"
 	"runtime"
-	"sync/atomic"
 	"time"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/api"
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/container"
 	"github.com/docker/docker/dockerversion"
 	"github.com/docker/docker/pkg/fileutils"
 	"github.com/docker/docker/pkg/parsers/kernel"
@@ -20,7 +18,7 @@ import (
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/registry"
 	"github.com/docker/docker/utils"
-	"github.com/docker/docker/volume/drivers"
+	volumedrivers "github.com/docker/docker/volume/drivers"
 	"github.com/docker/go-connections/sockets"
 )
 
@@ -57,18 +55,7 @@ func (daemon *Daemon) SystemInfo() (*types.Info, error) {
 	}
 
 	sysInfo := sysinfo.New(true)
-
-	var cRunning, cPaused, cStopped int32
-	daemon.containers.ApplyAll(func(c *container.Container) {
-		switch c.StateString() {
-		case "paused":
-			atomic.AddInt32(&cPaused, 1)
-		case "running":
-			atomic.AddInt32(&cRunning, 1)
-		default:
-			atomic.AddInt32(&cStopped, 1)
-		}
-	})
+	cRunning, cPaused, cStopped := stateCtr.get()
 
 	securityOptions := []string{}
 	if sysInfo.AppArmor {

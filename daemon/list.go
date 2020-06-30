@@ -5,16 +5,13 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
-	"strings"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
-	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/volume"
-	"github.com/docker/go-connections/nat"
 )
 
 var acceptedVolumeFilterTags = map[string]bool{
@@ -45,7 +42,7 @@ type iterationAction int
 
 // containerReducer represents a reducer for a container.
 // Returns the object to serialize by the api.
-type containerReducer func(*container.Container, *listContext) (*types.Container, error)
+type containerReducer func(*container.Snapshot, *listContext) (*types.Container, error)
 
 const (
 	// includeContainer is the action to include a container in the reducer.
@@ -81,9 +78,9 @@ type listContext struct {
 	exitAllowed []int
 
 	// beforeFilter is a filter to ignore containers that appear before the one given
-	beforeFilter *container.Container
+	beforeFilter *container.Snapshot
 	// sinceFilter is a filter to stop the filtering when the iterator arrive to the given container
-	sinceFilter *container.Container
+	sinceFilter *container.Snapshot
 
 	// taskFilter tells if we should filter based on wether a container is part of a task
 	taskFilter bool
@@ -93,21 +90,21 @@ type listContext struct {
 	*types.ContainerListOptions
 }
 
-// byContainerCreated is a temporary type used to sort a list of containers by creation time.
-type byContainerCreated []*container.Container
+// byCreatedDescending is a temporary type used to sort a list of containers by creation time.
+type byCreatedDescending []container.Snapshot
 
-func (r byContainerCreated) Len() int      { return len(r) }
-func (r byContainerCreated) Swap(i, j int) { r[i], r[j] = r[j], r[i] }
-func (r byContainerCreated) Less(i, j int) bool {
-	return r[i].Created.UnixNano() < r[j].Created.UnixNano()
+func (r byCreatedDescending) Len() int      { return len(r) }
+func (r byCreatedDescending) Swap(i, j int) { r[i], r[j] = r[j], r[i] }
+func (r byCreatedDescending) Less(i, j int) bool {
+	return r[j].CreatedAt.UnixNano() < r[i].CreatedAt.UnixNano()
 }
 
 // Containers returns the list of containers to show given the user's filtering.
 func (daemon *Daemon) Containers(config *types.ContainerListOptions) ([]*types.Container, error) {
-	return daemon.reduceContainers(config, daemon.transformContainer)
+	return daemon.reduceContainers(config, daemon.refreshImage)
 }
 
-func (daemon *Daemon) filterByNameIDMatches(ctx *listContext) []*container.Container {
+func (daemon *Daemon) filterByNameIDMatches(view container.View, ctx *listContext) ([]container.Snapshot, error) {
 	idSearch := false
 	names := ctx.filters.Get("name")
 	ids := ctx.filters.Get("id")
@@ -115,7 +112,9 @@ func (daemon *Daemon) filterByNameIDMatches(ctx *listContext) []*container.Conta
 		// if name or ID filters are not in use, return to
 		// standard behavior of walking the entire container
 		// list from the daemon's in-memory store
-		return daemon.List()
+		all, err := view.All()
+		sort.Sort(byCreatedDescending(all))
+		return all, err
 	}
 
 	// idSearch will determine if we limit name matching to the IDs
@@ -150,38 +149,46 @@ func (daemon *Daemon) filterByNameIDMatches(ctx *listContext) []*container.Conta
 		}
 	}
 
-	cntrs := make([]*container.Container, 0, len(matches))
+	cntrs := make([]container.Snapshot, 0, len(matches))
 	for id := range matches {
-		if c := daemon.containers.Get(id); c != nil {
-			cntrs = append(cntrs, c)
+		c, err := view.Get(id)
+		if err != nil {
+			return nil, err
+		}
+		if c != nil {
+			cntrs = append(cntrs, *c)
 		}
 	}
 
 	// Restore sort-order after filtering
 	// Created gives us nanosec resolution for sorting
-	sort.Sort(sort.Reverse(byContainerCreated(cntrs)))
+	sort.Sort(byCreatedDescending(cntrs))
 
-	return cntrs
+	return cntrs, nil
 }
 
 // reduceContainers parses the user's filtering options and generates the list of containers to return based on a reducer.
 func (daemon *Daemon) reduceContainers(config *types.ContainerListOptions, reducer containerReducer) ([]*types.Container, error) {
 	var (
+		view       = daemon.containersReplica.Snapshot(daemon.nameIndex)
 		containers = []*types.Container{}
 	)
 
-	ctx, err := daemon.foldFilter(config)
+	ctx, err := daemon.foldFilter(view, config)
 	if err != nil {
 		return nil, err
 	}
 
 	// fastpath to only look at a subset of containers if specific name
 	// or ID matches were provided by the user--otherwise we potentially
-	// end up locking and querying many more containers than intended
-	containerList := daemon.filterByNameIDMatches(ctx)
+	// end up querying many more containers than intended
+	containerList, err := daemon.filterByNameIDMatches(view, ctx)
+	if err != nil {
+		return nil, err
+	}
 
-	for _, container := range containerList {
-		t, err := daemon.reducePsContainer(container, ctx, reducer)
+	for i := range containerList {
+		t, err := daemon.reducePsContainer(&containerList[i], ctx, reducer)
 		if err != nil {
 			if err != errStopIteration {
 				return nil, err
@@ -198,13 +205,9 @@ func (daemon *Daemon) reduceContainers(config *types.ContainerListOptions, reduc
 }
 
 // reducePsContainer is the basic representation for a container as expected by the ps command.
-func (daemon *Daemon) reducePsContainer(container *container.Container, ctx *listContext, reducer containerReducer) (*types.Container, error) {
-	container.Lock()
-	defer container.Unlock()
-
+func (daemon *Daemon) reducePsContainer(container *container.Snapshot, ctx *listContext, reducer containerReducer) (*types.Container, error) {
 	// filter containers to return
-	action := includeContainerInList(container, ctx)
-	switch action {
+	switch includeContainerInList(container, ctx) {
 	case excludeContainer:
 		return nil, nil
 	case stopIteration:
@@ -212,11 +215,22 @@ func (daemon *Daemon) reducePsContainer(container *container.Container, ctx *lis
 	}
 
 	// transform internal container struct into api structs
-	return reducer(container, ctx)
+	newC, err := reducer(container, ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// release lock because size calculation is slow
+	if ctx.Size {
+		sizeRw, sizeRootFs := daemon.getSize(newC.ID)
+		newC.SizeRw = sizeRw
+		newC.SizeRootFs = sizeRootFs
+	}
+	return newC, nil
 }
 
 // foldFilter generates the container filter based on the user's filtering options.
-func (daemon *Daemon) foldFilter(config *types.ContainerListOptions) (*listContext, error) {
+func (daemon *Daemon) foldFilter(view container.View, config *types.ContainerListOptions) (*listContext, error) {
 	psFilters := config.Filters
 
 	if err := psFilters.Validate(acceptedPsFilterTags); err != nil {
@@ -273,10 +287,10 @@ func (daemon *Daemon) foldFilter(config *types.ContainerListOptions) (*listConte
 		return nil, err
 	}
 
-	var beforeContFilter, sinceContFilter *container.Container
+	var beforeContFilter, sinceContFilter *container.Snapshot
 
 	err = psFilters.WalkValues("before", func(value string) error {
-		beforeContFilter, err = daemon.GetContainer(value)
+		beforeContFilter, err = view.Get(value)
 		return err
 	})
 	if err != nil {
@@ -284,7 +298,7 @@ func (daemon *Daemon) foldFilter(config *types.ContainerListOptions) (*listConte
 	}
 
 	err = psFilters.WalkValues("since", func(value string) error {
-		sinceContFilter, err = daemon.GetContainer(value)
+		sinceContFilter, err = view.Get(value)
 		return err
 	})
 	if err != nil {
@@ -327,7 +341,7 @@ func (daemon *Daemon) foldFilter(config *types.ContainerListOptions) (*listConte
 
 // includeContainerInList decides whether a container should be included in the output or not based in the filter.
 // It also decides if the iteration should be stopped or not.
-func includeContainerInList(container *container.Container, ctx *listContext) iterationAction {
+func includeContainerInList(container *container.Snapshot, ctx *listContext) iterationAction {
 	// Do not include container if it's in the list before the filter container.
 	// Set the filter container to nil to include the rest of containers after this one.
 	if ctx.beforeFilter != nil {
@@ -366,7 +380,7 @@ func includeContainerInList(container *container.Container, ctx *listContext) it
 	}
 
 	// Do not include container if any of the labels don't match
-	if !ctx.filters.MatchKVList("label", container.Config.Labels) {
+	if !ctx.filters.MatchKVList("label", container.Labels) {
 		return excludeContainer
 	}
 
@@ -384,7 +398,7 @@ func includeContainerInList(container *container.Container, ctx *listContext) it
 	if len(ctx.exitAllowed) > 0 {
 		shouldSkip := true
 		for _, code := range ctx.exitAllowed {
-			if code == container.ExitCode() && !container.Running && !container.StartedAt.IsZero() {
+			if code == container.ExitCode && !container.Running && !container.StartedAt.IsZero() {
 				shouldSkip = false
 				break
 			}
@@ -395,28 +409,34 @@ func includeContainerInList(container *container.Container, ctx *listContext) it
 	}
 
 	// Do not include container if its status doesn't match the filter
-	if !ctx.filters.Match("status", container.State.StateString()) {
+	if !ctx.filters.Match("status", container.State) {
 		return excludeContainer
 	}
 
 	// Do not include container if its health doesn't match the filter
-	if !ctx.filters.ExactMatch("health", container.State.HealthString()) {
+	if !ctx.filters.ExactMatch("health", container.Health) {
 		return excludeContainer
 	}
 
 	if ctx.filters.Include("volume") {
-		volumesByName := make(map[string]*volume.MountPoint)
-		for _, m := range container.MountPoints {
+		volumesByName := make(map[string]types.MountPoint)
+		for _, m := range container.Mounts {
 			if m.Name != "" {
 				volumesByName[m.Name] = m
 			} else {
 				volumesByName[m.Source] = m
 			}
 		}
+		volumesByDestination := make(map[string]types.MountPoint)
+		for _, m := range container.Mounts {
+			if m.Destination != "" {
+				volumesByDestination[m.Destination] = m
+			}
+		}
 
 		volumeExist := fmt.Errorf("volume mounted in container")
 		err := ctx.filters.WalkValues("volume", func(value string) error {
-			if _, exist := container.MountPoints[value]; exist {
+			if _, exist := volumesByDestination[value]; exist {
 				return volumeExist
 			}
 			if _, exist := volumesByName[value]; exist {
@@ -433,19 +453,25 @@ func includeContainerInList(container *container.Container, ctx *listContext) it
 		if len(ctx.images) == 0 {
 			return excludeContainer
 		}
-		if !ctx.images[container.ImageID] {
+		if !ctx.images[image.ID(container.ImageID)] {
 			return excludeContainer
 		}
 	}
 
-	networkExist := fmt.Errorf("container part of network")
+	var (
+		networkExist = errors.New("container part of network")
+		noNetworks   = errors.New("container is not part of any networks")
+	)
 	if ctx.filters.Include("network") {
 		err := ctx.filters.WalkValues("network", func(value string) error {
+			if container.NetworkSettings == nil {
+				return noNetworks
+			}
 			if _, ok := container.NetworkSettings.Networks[value]; ok {
 				return networkExist
 			}
 			for _, nw := range container.NetworkSettings.Networks {
-				if nw.EndpointSettings == nil {
+				if nw == nil {
 					continue
 				}
 				if nw.NetworkID == value {
@@ -462,111 +488,22 @@ func includeContainerInList(container *container.Container, ctx *listContext) it
 	return includeContainer
 }
 
-// transformContainer generates the container type expected by the docker ps command.
-func (daemon *Daemon) transformContainer(container *container.Container, ctx *listContext) (*types.Container, error) {
-	newC := &types.Container{
-		ID:      container.ID,
-		Names:   ctx.names[container.ID],
-		ImageID: container.ImageID.String(),
-	}
-	if newC.Names == nil {
-		// Dead containers will often have no name, so make sure the response isn't null
-		newC.Names = []string{}
-	}
-
-	image := container.Config.Image // if possible keep the original ref
-	if image != container.ImageID.String() {
+// refreshImage checks if the Image ref still points to the correct ID, and updates the ref to the actual ID when it doesn't
+func (daemon *Daemon) refreshImage(s *container.Snapshot, ctx *listContext) (*types.Container, error) {
+	c := s.Container
+	image := s.Image // keep the original ref if still valid (hasn't changed)
+	if image != s.ImageID {
 		id, err := daemon.GetImageID(image)
 		if _, isDNE := err.(ErrImageDoesNotExist); err != nil && !isDNE {
 			return nil, err
 		}
-		if err != nil || id != container.ImageID {
-			image = container.ImageID.String()
+		if err != nil || id.String() != s.ImageID {
+			// ref changed, we need to use original ID
+			image = s.ImageID
 		}
 	}
-	newC.Image = image
-
-	if len(container.Args) > 0 {
-		args := []string{}
-		for _, arg := range container.Args {
-			if strings.Contains(arg, " ") {
-				args = append(args, fmt.Sprintf("'%s'", arg))
-			} else {
-				args = append(args, arg)
-			}
-		}
-		argsAsString := strings.Join(args, " ")
-
-		newC.Command = fmt.Sprintf("%s %s", container.Path, argsAsString)
-	} else {
-		newC.Command = container.Path
-	}
-	newC.Created = container.Created.Unix()
-	newC.State = container.State.StateString()
-	newC.Status = container.State.String()
-	newC.HostConfig.NetworkMode = string(container.HostConfig.NetworkMode)
-	// copy networks to avoid races
-	networks := make(map[string]*networktypes.EndpointSettings)
-	for name, network := range container.NetworkSettings.Networks {
-		if network == nil || network.EndpointSettings == nil {
-			continue
-		}
-		networks[name] = &networktypes.EndpointSettings{
-			EndpointID:          network.EndpointID,
-			Gateway:             network.Gateway,
-			IPAddress:           network.IPAddress,
-			IPPrefixLen:         network.IPPrefixLen,
-			IPv6Gateway:         network.IPv6Gateway,
-			GlobalIPv6Address:   network.GlobalIPv6Address,
-			GlobalIPv6PrefixLen: network.GlobalIPv6PrefixLen,
-			MacAddress:          network.MacAddress,
-			NetworkID:           network.NetworkID,
-		}
-		if network.IPAMConfig != nil {
-			networks[name].IPAMConfig = &networktypes.EndpointIPAMConfig{
-				IPv4Address: network.IPAMConfig.IPv4Address,
-				IPv6Address: network.IPAMConfig.IPv6Address,
-			}
-		}
-	}
-	newC.NetworkSettings = &types.SummaryNetworkSettings{Networks: networks}
-
-	newC.Ports = []types.Port{}
-	for port, bindings := range container.NetworkSettings.Ports {
-		p, err := nat.ParsePort(port.Port())
-		if err != nil {
-			return nil, err
-		}
-		if len(bindings) == 0 {
-			newC.Ports = append(newC.Ports, types.Port{
-				PrivatePort: uint16(p),
-				Type:        port.Proto(),
-			})
-			continue
-		}
-		for _, binding := range bindings {
-			h, err := nat.ParsePort(binding.HostPort)
-			if err != nil {
-				return nil, err
-			}
-			newC.Ports = append(newC.Ports, types.Port{
-				PrivatePort: uint16(p),
-				PublicPort:  uint16(h),
-				Type:        port.Proto(),
-				IP:          binding.HostIP,
-			})
-		}
-	}
-
-	if ctx.Size {
-		sizeRw, sizeRootFs := daemon.getSize(container)
-		newC.SizeRw = sizeRw
-		newC.SizeRootFs = sizeRootFs
-	}
-	newC.Labels = container.Config.Labels
-	newC.Mounts = addMountPoints(container)
-
-	return newC, nil
+	c.Image = image
+	return &c, nil
 }
 
 // Volumes lists known volumes, using the filter to restrict the range

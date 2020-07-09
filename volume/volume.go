@@ -120,6 +120,12 @@ type MountPoint struct {
 
 	// Sepc is a copy of the API request that created this mount.
 	Spec mounttypes.Mount
+
+	// Some bind mounts should not be automatically created.
+	// (Some are auto-created for backwards-compatability)
+	// This is checked on the API but setting this here prevents race conditions
+	// where a bind dir existed during validation was removed before reaching the setup code.
+	SkipMountpointCreation bool
 }
 
 // Setup sets up a mount point by either mounting the volume if it is
@@ -127,6 +133,10 @@ type MountPoint struct {
 // The, optional, checkFun parameter allows doing additional checking
 // before creating the source directory on the host.
 func (m *MountPoint) Setup(mountLabel string, rootUID, rootGID int, checkFun func(m *MountPoint) error) (path string, err error) {
+	if m.SkipMountpointCreation {
+		return m.Source, nil
+	}
+
 	defer func() {
 		if err == nil {
 			if label.RelabelNeeded(m.Mode) {
@@ -174,6 +184,7 @@ func (m *MountPoint) Setup(mountLabel string, rootUID, rootGID int, checkFun fun
 				return "", err
 			}
 		}
+
 		// idtools.MkdirAllNewAs() produces an error if m.Source exists and is a file (not a directory)
 		// also, makes sure that if the directory is created, the correct remapped rootUID/rootGID will own it
 		if err := idtools.MkdirAllNewAs(m.Source, 0755, rootUID, rootGID); err != nil {

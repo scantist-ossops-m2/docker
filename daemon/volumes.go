@@ -15,7 +15,7 @@ import (
 	mounttypes "github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/volume"
-	"github.com/docker/docker/volume/drivers"
+	volumedrivers "github.com/docker/docker/volume/drivers"
 )
 
 var (
@@ -194,6 +194,10 @@ func (daemon *Daemon) registerMountPoints(container *container.Container, hostCo
 			}); ok {
 				mp.Source = cv.CachedPath()
 			}
+		}
+
+		if mp.Type == mounttypes.TypeBind {
+			mp.SkipMountpointCreation = true
 		}
 
 		binds[mp.Destination] = true

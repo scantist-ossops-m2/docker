@@ -141,12 +141,10 @@ func (r *remote) handleConnectionChange() {
 
 	logrus.Debugf("libcontainerd: maximum number of retries for containerd health check is %d", r.maxHealthCheckRetries)
 
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
 	healthClient := grpc_health_v1.NewHealthClient(r.rpcConn)
 
 	for {
-		<-ticker.C
+		time.Sleep(500 * time.Millisecond)
 		ctx, cancel := context.WithTimeout(context.Background(), containerdHealthCheckTimeout)
 		_, err := healthClient.Check(ctx, &grpc_health_v1.HealthCheckRequest{})
 		cancel()

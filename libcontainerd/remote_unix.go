@@ -183,9 +183,21 @@ func (r *remote) handleConnectionChange() {
 					utils.KillProcess(r.daemonPid)
 				}
 				<-r.daemonWaitCh
+
+				r.rpcConn.Close()
+				os.Remove(r.rpcAddr)
+
 				if err := r.runContainerdDaemon(); err != nil { //FIXME: Handle error
 					logrus.Errorf("libcontainerd: error restarting containerd: %v", err)
+					continue
 				}
+
+				if err := r.newConn(); err != nil {
+					logrus.Errorf("libcontainerd: error reconnecting to containerd: %v", err)
+				}
+
+				healthClient = grpc_health_v1.NewHealthClient(r.rpcConn)
+
 				continue
 			}
 		}

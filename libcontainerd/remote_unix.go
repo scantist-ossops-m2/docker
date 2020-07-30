@@ -63,6 +63,26 @@ type remote struct {
 	restoreFromTimestamp  *timestamp.Timestamp
 }
 
+func (r *remote) newConn() error {
+	// don't output the grpc reconnect logging
+	grpclog.SetLogger(log.New(ioutil.Discard, "", log.LstdFlags))
+
+	dialOpts := append([]grpc.DialOption{grpc.WithInsecure()},
+		grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
+			return net.DialTimeout("unix", addr, timeout)
+		}),
+	)
+	conn, err := grpc.Dial(r.rpcAddr, dialOpts...)
+	if err != nil {
+		return fmt.Errorf("error connecting to containerd: %v", err)
+	}
+
+	r.rpcConn = conn
+	r.apiClient = containerd.NewAPIClient(conn)
+
+	return nil
+}
+
 // New creates a fresh instance of libcontainerd remote.
 func New(stateDir string, options ...RemoteOption) (_ Remote, err error) {
 	defer func() {
@@ -95,20 +115,9 @@ func New(stateDir string, options ...RemoteOption) (_ Remote, err error) {
 		}
 	}
 
-	// don't output the grpc reconnect logging
-	grpclog.SetLogger(log.New(ioutil.Discard, "", log.LstdFlags))
-	dialOpts := append([]grpc.DialOption{grpc.WithInsecure()},
-		grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
-			return net.DialTimeout("unix", addr, timeout)
-		}),
-	)
-	conn, err := grpc.Dial(r.rpcAddr, dialOpts...)
-	if err != nil {
-		return nil, fmt.Errorf("error connecting to containerd: %v", err)
+	if err := r.newConn(); err != nil {
+		return nil, err
 	}
-
-	r.rpcConn = conn
-	r.apiClient = containerd.NewAPIClient(conn)
 
 	// Get the timestamp to restore from
 	t := r.getLastEventTimestamp()

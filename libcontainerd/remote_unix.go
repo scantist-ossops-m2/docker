@@ -49,7 +49,7 @@ type remote struct {
 	stateDir              string
 	rpcAddr               string
 	startDaemon           bool
-	closeManually         bool
+	closedManually        bool
 	debugLog              bool
 	rpcConn               *grpc.ClientConn
 	clients               []*client
@@ -61,6 +61,28 @@ type remote struct {
 	oomScore              int
 	maxHealthCheckRetries int
 	restoreFromTimestamp  *timestamp.Timestamp
+}
+
+func (r *remote) newConn() error {
+	// don't output the grpc reconnect logging
+	grpclog.SetLogger(log.New(ioutil.Discard, "", log.LstdFlags))
+
+	dialOpts := []grpc.DialOption{
+		grpc.WithInsecure(),
+		grpc.WithBackoffMaxDelay(2 * time.Second),
+		grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
+			return net.DialTimeout("unix", addr, timeout)
+		}),
+	}
+	conn, err := grpc.Dial(r.rpcAddr, dialOpts...)
+	if err != nil {
+		return fmt.Errorf("error connecting to containerd: %v", err)
+	}
+
+	r.rpcConn = conn
+	r.apiClient = containerd.NewAPIClient(conn)
+
+	return nil
 }
 
 // New creates a fresh instance of libcontainerd remote.
@@ -95,20 +117,9 @@ func New(stateDir string, options ...RemoteOption) (_ Remote, err error) {
 		}
 	}
 
-	// don't output the grpc reconnect logging
-	grpclog.SetLogger(log.New(ioutil.Discard, "", log.LstdFlags))
-	dialOpts := append([]grpc.DialOption{grpc.WithInsecure()},
-		grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
-			return net.DialTimeout("unix", addr, timeout)
-		}),
-	)
-	conn, err := grpc.Dial(r.rpcAddr, dialOpts...)
-	if err != nil {
-		return nil, fmt.Errorf("error connecting to containerd: %v", err)
+	if err := r.newConn(); err != nil {
+		return nil, err
 	}
-
-	r.rpcConn = conn
-	r.apiClient = containerd.NewAPIClient(conn)
 
 	// Get the timestamp to restore from
 	t := r.getLastEventTimestamp()
@@ -141,12 +152,10 @@ func (r *remote) handleConnectionChange() {
 
 	logrus.Debugf("libcontainerd: maximum number of retries for containerd health check is %d", r.maxHealthCheckRetries)
 
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
 	healthClient := grpc_health_v1.NewHealthClient(r.rpcConn)
 
 	for {
-		<-ticker.C
+		time.Sleep(500 * time.Millisecond)
 		ctx, cancel := context.WithTimeout(context.Background(), containerdHealthCheckTimeout)
 		_, err := healthClient.Check(ctx, &grpc_health_v1.HealthCheckRequest{})
 		cancel()
@@ -159,7 +168,7 @@ func (r *remote) handleConnectionChange() {
 		logrus.Debugf("libcontainerd: containerd health check returned error: %v", err)
 
 		if r.daemonPid != -1 {
-			if strings.Contains(err.Error(), "is closing") {
+			if r.closedManually {
 				// Well, we asked for it to stop, just return
 				return
 			}
@@ -176,9 +185,21 @@ func (r *remote) handleConnectionChange() {
 					utils.KillProcess(r.daemonPid)
 				}
 				<-r.daemonWaitCh
+
+				r.rpcConn.Close()
+				os.Remove(r.rpcAddr)
+
 				if err := r.runContainerdDaemon(); err != nil { //FIXME: Handle error
 					logrus.Errorf("libcontainerd: error restarting containerd: %v", err)
+					continue
 				}
+
+				if err := r.newConn(); err != nil {
+					logrus.Errorf("libcontainerd: error reconnecting to containerd: %v", err)
+				}
+
+				healthClient = grpc_health_v1.NewHealthClient(r.rpcConn)
+
 				continue
 			}
 		}
@@ -189,7 +210,7 @@ func (r *remote) Cleanup() {
 	if r.daemonPid == -1 {
 		return
 	}
-	r.closeManually = true
+	r.closedManually = true
 	r.rpcConn.Close()
 	// Ask the daemon to quit
 	syscall.Kill(r.daemonPid, syscall.SIGTERM)
@@ -289,10 +310,23 @@ func (r *remote) startEventsMonitor() error {
 	er := &containerd.EventsRequest{
 		Timestamp: tsp,
 	}
-	events, err := r.apiClient.Events(context.Background(), er, grpc.FailFast(false))
-	if err != nil {
-		return err
+
+	var events containerd.API_EventsClient
+	for {
+		events, err = r.apiClient.Events(context.Background(), er, grpc.FailFast(false))
+		if err == nil {
+			break
+		}
+		logrus.Warnf("libcontainerd: failed to get events from containerd: %q", err)
+
+		if r.closedManually {
+			// ignore error if grpc remote connection is closed manually
+			return nil
+		}
+
+		<-time.After(100 * time.Millisecond)
 	}
+
 	go r.handleEventStream(events)
 	return nil
 }
@@ -302,7 +336,7 @@ func (r *remote) handleEventStream(events containerd.API_EventsClient) {
 		e, err := events.Recv()
 		if err != nil {
 			if grpc.ErrorDesc(err) == transport.ErrConnClosing.Desc &&
-				r.closeManually {
+				r.closedManually {
 				// ignore error if grpc remote connection is closed manually
 				return
 			}

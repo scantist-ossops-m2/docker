@@ -39,7 +39,8 @@ func InitLabels(options []string) (plabel string, mlabel string, Err error) {
 		mcon := selinux.NewContext(mountLabel)
 		for _, opt := range options {
 			if opt == "disable" {
-				return "", mountLabel, nil
+				UnreserveLabel(processLabel)
+				return "", "", nil
 			}
 			if i := strings.Index(opt, ":"); i == -1 {
 				return "", "", fmt.Errorf("Bad label option %q, valid options 'disable' or \n'user, role, level, type' followed by ':' and a value", opt)

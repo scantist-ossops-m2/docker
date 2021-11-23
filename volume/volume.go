@@ -140,7 +140,8 @@ func (m *MountPoint) Setup(mountLabel string, rootUID, rootGID int, checkFun fun
 	defer func() {
 		if err == nil {
 			if label.RelabelNeeded(m.Mode) {
-				sourcePath, err := filepath.EvalSymlinks(m.Source)
+				var sourcePath string
+				sourcePath, err = filepath.EvalSymlinks(m.Source)
 				if err != nil {
 					path = ""
 					err = errors.Wrapf(err, "error evaluating symlink from mount source '%s'", m.Source)
